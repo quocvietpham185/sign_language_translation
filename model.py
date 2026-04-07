@@ -4,10 +4,14 @@ model.py — Upgraded HST-GNN Architecture
 Upgrades từ bài gốc:
   • Bỏ ResNet-152 → skeleton keypoints trực tiếp
   • Graph Convolution + Graph Transformer (giữ từ bài gốc, tối ưu hóa)
-  • Temporal Encoder: 1D Conv + Transformer thay LSTM
+  • Temporal Encoder: 1D Conv + Sliding-Window Transformer (fix global-attention bug)
   • mBART-50 pretrained text decoder (thay 2×LSTM)
   • Gradient checkpointing support
-  • Learnable adjacency matrix nhẹ hơn (factored bilinear → cosine similarity)
+  • Learnable adjacency matrix nhẹ hơn (cosine similarity)
+
+Fix v2:
+  • TemporalEncoder dùng Sliding Window Attention (window=5 frames) thay Global Attention
+    → đúng với kết luận bài gốc: cửa sổ ngữ cảnh cục bộ nhỏ tốt hơn
 """
 
 import math
@@ -16,6 +20,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 from transformers import MBartForConditionalGeneration, MBartConfig
+from transformers.modeling_outputs import BaseModelOutput
 
 
 # ══════════════════════════════════════════════════════════════
@@ -199,7 +204,7 @@ class HierarchicalGraphEncoder(nn.Module):
     Xử lý 2 cấp graph:
       Level 1 (high-level): 4 nodes = [pose_body, left_hand, right_hand, face]
       Level 2 (fine-level): full N keypoints per region
-    
+
     Bài gốc dùng ResNet feature cho Level 1 — ở đây dùng learned aggregation.
     """
     def __init__(self, d_model: int, num_heads: int,
@@ -275,7 +280,6 @@ class HierarchicalGraphEncoder(nn.Module):
         # Stack pose + left_hand + right_hand
         fine_nodes = []
         for name in ["pose", "left_hand", "right_hand"]:
-            start, end = self.REGION_NODES[name]
             fine_nodes.append(x_regions[name])  # (B, T, n, d)
         fine_x = torch.cat(fine_nodes, dim=2)   # (B, T, 75, d)
         BT = B * T
@@ -314,7 +318,6 @@ class HierarchicalGraphEncoder(nn.Module):
         high_x = high_x.reshape(B, T, 4, -1)
 
         # ── Hierarchical Pooling → single vector per frame ──
-        # Fine pooled + high pooled
         fine_pooled = fine_x.mean(dim=2)         # (B, T, d)
         high_pooled = high_x.mean(dim=2)         # (B, T, d)
 
@@ -323,8 +326,26 @@ class HierarchicalGraphEncoder(nn.Module):
 
 
 # ══════════════════════════════════════════════════════════════
-#  6. TEMPORAL ENCODER (Thay LSTM → 1D Conv + Transformer)
+#  6. TEMPORAL ENCODER — Sliding Window Transformer
+#     FIX: Thay Global Attention → Local Sliding Window Attention
+#     Lý do: Bài gốc kết luận window_size > 3 gây nhiễu.
+#     Transformer Global Attention vi phạm điều này → phải mask.
 # ══════════════════════════════════════════════════════════════
+
+def make_sliding_window_mask(T: int, window: int, device: torch.device) -> torch.Tensor:
+    """
+    Tạo causal-free sliding window attention mask.
+    mask[i, j] = True  → token i KHÔNG được attend token j (bị block)
+    mask[i, j] = False → token i CÓ THỂ attend token j
+
+    Mỗi token chỉ nhìn thấy [i-window, i+window] xung quanh nó.
+    Consistent với kết luận bài gốc: window_size ≤ 3-5 tốt nhất.
+    """
+    idx = torch.arange(T, device=device)
+    diff = (idx.unsqueeze(0) - idx.unsqueeze(1)).abs()  # (T, T)
+    mask = diff > window   # True = blocked
+    return mask             # (T, T) bool
+
 
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model: int, max_len: int = 2000, dropout: float = 0.1):
@@ -344,13 +365,17 @@ class PositionalEncoding(nn.Module):
 
 class TemporalEncoder(nn.Module):
     """
-    1D Depthwise Conv → Transformer
-    Nhẹ hơn LSTM, song song hóa được, BLEU tốt hơn.
+    1D Depthwise Conv → Sliding-Window Transformer
+
+    FIX v2: Thay global TransformerEncoder → local sliding window attention.
+    window_size=5 frames: mỗi frame chỉ attend 5 frame trước/sau.
+    Đúng với bài gốc — ngăn nhiễu từ hành động xa không liên quan.
     """
     def __init__(self, d_model: int, num_heads: int, num_layers: int,
-                 dropout: float, use_ckpt: bool = False):
+                 dropout: float, window_size: int = 5, use_ckpt: bool = False):
         super().__init__()
         self.use_ckpt = use_ckpt
+        self.window_size = window_size
 
         # Local temporal pattern (conv)
         self.local_conv = nn.Sequential(
@@ -362,7 +387,9 @@ class TemporalEncoder(nn.Module):
 
         self.pos_enc = PositionalEncoding(d_model, dropout=dropout)
 
-        # Transformer layers
+        # Sliding-Window Transformer layers
+        # Dùng nn.TransformerEncoderLayer nhưng forward luôn truyền
+        # attn_mask=sliding_window_mask → chặn global attention
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
             nhead=num_heads,
@@ -373,12 +400,24 @@ class TemporalEncoder(nn.Module):
             norm_first=True,  # Pre-LN (ổn định hơn)
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self._cached_mask = None
+        self._cached_T = -1
+
+    def _get_local_mask(self, T: int, device: torch.device) -> torch.Tensor:
+        """Cache mask để không tạo lại mỗi step."""
+        if self._cached_T != T or self._cached_mask is None or \
+                self._cached_mask.device != device:
+            self._cached_mask = make_sliding_window_mask(T, self.window_size, device)
+            self._cached_T = T
+        return self._cached_mask
 
     def forward(self, x: torch.Tensor, padding_mask: torch.Tensor = None) -> torch.Tensor:
         """
         x: (B, T, d_model)
         padding_mask: (B, T) — True where padded
         """
+        T = x.size(1)
+
         # Local conv (operate on channel dim)
         h = x.transpose(1, 2)           # (B, d, T)
         h = self.local_conv(h)
@@ -386,7 +425,15 @@ class TemporalEncoder(nn.Module):
         x = x + h                       # residual
 
         x = self.pos_enc(x)
-        x = self.transformer(x, src_key_padding_mask=padding_mask)
+
+        # Sliding window attention mask (T, T)
+        local_mask = self._get_local_mask(T, x.device)
+
+        x = self.transformer(
+            x,
+            mask=local_mask,                    # (T,T) local attention
+            src_key_padding_mask=padding_mask,  # (B,T) padding
+        )
         return x
 
 
@@ -462,14 +509,17 @@ class LightweightMBartDecoder(nn.Module):
         """
         enc_h = self.enc_proj(encoder_hidden)    # (B, T, mbart_d)
 
-        # attention_mask: 1 = keep, 0 = pad (ngược với PyTorch convention)
+        # attention_mask: 1 = keep, 0 = pad
         enc_attn_mask = (~encoder_mask).long()
+
+        # Bọc trong BaseModelOutput (transformers >= 4.36 yêu cầu object thay vì tuple)
+        encoder_outputs = BaseModelOutput(last_hidden_state=enc_h)
 
         outputs = self.mbart(
             inputs_embeds=None,
             attention_mask=enc_attn_mask,
             decoder_input_ids=decoder_input_ids,
-            encoder_outputs=(enc_h, None, None),
+            encoder_outputs=encoder_outputs,
             return_dict=True,
         )
         return outputs.logits                    # (B, Lw, vocab)
@@ -480,11 +530,16 @@ class LightweightMBartDecoder(nn.Module):
                  forced_bos_token_id: int = None,
                  max_length: int = 128,
                  num_beams: int = 4) -> torch.Tensor:
-        enc_h = self.enc_proj(encoder_hidden)
+        # Ép về FP32 để tránh lỗi Half/Float mismatch khi dùng AMP
+        encoder_hidden = encoder_hidden.float()
+        enc_h = self.enc_proj.float()(encoder_hidden)  # proj cũng về FP32
         enc_attn_mask = (~encoder_mask).long()
 
+        # Bọc trong BaseModelOutput (transformers mới yêu cầu)
+        encoder_outputs = BaseModelOutput(last_hidden_state=enc_h)
+
         out = self.mbart.generate(
-            encoder_outputs=(enc_h,),
+            encoder_outputs=encoder_outputs,
             attention_mask=enc_attn_mask,
             forced_bos_token_id=forced_bos_token_id,
             max_length=max_length,
@@ -502,11 +557,15 @@ class UpgradedHSTGNN(nn.Module):
     Full upgraded pipeline:
       Keypoints → SkeletonEmbedding
                 → HierarchicalGraphEncoder (GCN + GraphTransformer)
-                → TemporalEncoder (Conv + Transformer)
+                → TemporalEncoder (Conv + Sliding-Window Transformer)
                 ↙              ↘
          CTCGlossHead     LightweightMBartDecoder
               ↓                    ↓
           gloss_log_probs       text_logits
+
+    dataset_mode aware:
+      "continuous" → CTC + CE loss (PHOENIX, CSL)
+      "isolated"   → CE loss only (WLASL, Kaggle sign datasets)
     """
 
     def __init__(
@@ -517,6 +576,7 @@ class UpgradedHSTGNN(nn.Module):
         num_graph_layers: int = 2,
         num_heads: int = 8,
         num_temporal_layers: int = 4,
+        temporal_window_size: int = 5,          # Sliding window size (bài gốc: ≤5)
         num_gloss_classes: int = 1200,
         text_vocab_size: int = 32000,
         decoder_name: str = "facebook/mbart-large-50",
@@ -553,6 +613,7 @@ class UpgradedHSTGNN(nn.Module):
             num_heads=num_heads,
             num_layers=num_temporal_layers,
             dropout=dropout,
+            window_size=temporal_window_size,   # ← Sliding window!
             use_ckpt=use_gradient_checkpointing,
         )
 
@@ -607,7 +668,7 @@ class UpgradedHSTGNN(nn.Module):
         # ── Graph encoder ──
         graph_out = self.graph_encoder(regions, keypoints)   # (B, T, d)
 
-        # ── Temporal encoder ──
+        # ── Temporal encoder (Sliding Window) ──
         encoder_out = self.temporal_encoder(graph_out, padding_mask)  # (B, T, d)
 
         # ── Temporal subsampling (CTC standard: T → T/2) ──

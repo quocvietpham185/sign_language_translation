@@ -194,10 +194,42 @@ class KeypointNormalizer:
 #  DATASET
 # ══════════════════════════════════════════════════════════════
 
+# Mapping dataset slug → mode
+# "continuous": multi-sign video (dùng CTC loss)
+# "isolated":   single-sign video (chỉ dùng CE loss)
+DATASET_MODE_MAP = {
+    "phoenix":               "continuous",
+    "phoenix-2014t":         "continuous",
+    "csl":                   "continuous",
+    "csl-daily":             "continuous",
+    "wlasl":                 "isolated",
+    "wlasl-processed":       "isolated",
+    "asl-alphabet":          "isolated",
+    "sign-language-mnist":   "isolated",
+    "kaggle":                "isolated",
+    "msasl":                 "isolated",
+    "autsl":                 "isolated",
+}
+
+def get_dataset_mode(dataset_name: str) -> str:
+    """Trả về 'continuous' hoặc 'isolated' từ tên dataset."""
+    name_lower = dataset_name.lower().strip()
+    for key, mode in DATASET_MODE_MAP.items():
+        if key in name_lower:
+            return mode
+    # Default: nếu gloss có >1 token thì continuous, còn lại isolated
+    return "continuous"
+
+
 class SignLanguageDataset(Dataset):
     """
     Universal Sign Language Dataset.
-    
+
+    Hỗ trợ cả Continuous SL (PHOENIX, CSL) và Isolated SL (WLASL, Kaggle).
+    dataset_mode field tự động xác định dựa trên tên dataset:
+      - "continuous" → dùng CTC + CE loss
+      - "isolated"   → chỉ dùng CE loss (tránh bug CTC với 1 ký hiệu)
+
     Format JSON mỗi sample:
     {
         "id": "sample_0001",
@@ -333,12 +365,25 @@ class SignLanguageDataset(Dataset):
         text_ids = self.text_vocab.encode(text_str, add_bos=True, add_eos=True)
         text_tensor = torch.tensor(text_ids, dtype=torch.long)
 
+        # Xác định dataset_mode dựa trên tên dataset
+        dataset_name = sample.get("dataset", "unknown")
+        # Cho phép sample tự khai báo mode (override)
+        if "dataset_mode" in sample:
+            mode = sample["dataset_mode"]
+        else:
+            # Auto-detect: isolated nếu chỉ có 1 gloss token
+            detected = get_dataset_mode(dataset_name)
+            if detected == "continuous" and len(gloss_ids) <= 1:
+                detected = "isolated"  # Single-sign → dùng CE only
+            mode = detected
+
         return {
             "id": sample.get("id", str(idx)),
             "keypoints": kps_tensor,                        # (T, 543, 4)
             "gloss_ids": gloss_tensor,                      # (Lg,)
             "text_ids": text_tensor,                        # (Lw,)
-            "dataset": sample.get("dataset", "unknown"),
+            "dataset": dataset_name,
+            "dataset_mode": mode,                           # "continuous" | "isolated"
         }
 
 
@@ -349,11 +394,13 @@ class SignLanguageDataset(Dataset):
 def collate_fn(batch: List[dict]) -> dict:
     """
     Dynamic padding cho variable-length sequences.
+    Giữ nguyên dataset_mode (list of strings, không cần pad).
     """
     ids = [b["id"] for b in batch]
     keypoints = [b["keypoints"] for b in batch]             # list of (T_i, 543, 4)
     gloss_ids = [b["gloss_ids"] for b in batch]
     text_ids = [b["text_ids"] for b in batch]
+    dataset_modes = [b.get("dataset_mode", "continuous") for b in batch]
 
     # Actual lengths
     kp_lengths = torch.tensor([k.shape[0] for k in keypoints], dtype=torch.long)
@@ -382,6 +429,7 @@ def collate_fn(batch: List[dict]) -> dict:
         "gloss_lengths": gloss_lengths,
         "text_ids": text_padded,
         "text_lengths": text_lengths,
+        "dataset_mode": dataset_modes,      # list[str]: "continuous" | "isolated"
     }
 
 

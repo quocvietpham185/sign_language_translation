@@ -1,18 +1,18 @@
 """
 ===============================================================
-  UPGRADED HST-GNN FOR SIGN LANGUAGE TRANSLATION
+  UPGRADED HST-GNN FOR SIGN LANGUAGE TRANSLATION v2
   Based on: arxiv 2111.07258 — Kan et al., 2021
-  Upgrades:
-    1. MediaPipe keypoints thay ResNet-152 (không cần GPU preprocess)
-    2. Lightweight Graph Encoder (GCN + Graph Transformer)
-    3. mBART-50 pretrained decoder (thay 2×LSTM)
-    4. CTC + Cross-Entropy joint loss
-    5. Mixed Precision Training (AMP)
-    6. Gradient Checkpointing (tiết kiệm VRAM)
-    7. Multi-dataset support (PHOENIX, WLASL, CSL, Kaggle)
-    8. Data Augmentation (flip, noise, time stretch, dropout)
-    9. Cosine LR + Warmup scheduler
-   10. Auto-resume từ checkpoint (Colab-friendly)
+
+  Upgrades v2:
+    1. Fix CTC loss bug với isolated sign datasets (WLASL)
+       → dataset_mode="continuous" mới dùng CTC
+       → dataset_mode="isolated" chỉ dùng CE loss
+    2. Sliding Window Transformer trong TemporalEncoder
+    3. Timed Drive auto-save (mỗi N phút, không cần thủ công)
+    4. 2-phase training:
+       Phase 1 → Pretrain graph encoder + CTC (freeze mBART decoder)
+       Phase 2 → Fine-tune decoder (freeze encoder)
+    5. Per-step checkpoint backup (đảm bảo không mất data khi Colab die)
 ===============================================================
 """
 
@@ -20,6 +20,7 @@ import os
 import sys
 import json
 import time
+import shutil
 import random
 import logging
 import argparse
@@ -30,7 +31,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.cuda.amp import GradScaler, autocast
+from torch.cuda.amp import GradScaler
+from torch.amp import autocast
 from torch.utils.data import DataLoader
 
 from config import get_config
@@ -44,22 +46,183 @@ from scheduler import WarmupCosineScheduler
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Upgraded HST-GNN Training")
-    parser.add_argument("--config", type=str, default="configs/phoenix.yaml",
-                        help="Path to config file")
-    parser.add_argument("--resume", type=str, default=None,
-                        help="Path to checkpoint to resume from")
-    parser.add_argument("--eval_only", action="store_true",
-                        help="Only run evaluation")
-    parser.add_argument("--output_dir", type=str, default="outputs/",
-                        help="Output directory")
+    parser = argparse.ArgumentParser(description="Upgraded HST-GNN v2 Training")
+    parser.add_argument("--config", type=str, default="configs/colab.yaml")
+    parser.add_argument("--resume", type=str, default=None)
+    parser.add_argument("--eval_only", action="store_true")
+    parser.add_argument("--phase", type=int, default=0,
+                        help="0=joint, 1=pretrain encoder only, 2=finetune decoder only")
+    parser.add_argument("--output_dir", type=str, default="outputs/")
     parser.add_argument("--drive_backup", type=str, default=None,
-                        help="Google Drive path for checkpoint backup")
+                        help="Google Drive path for timed checkpoint backup")
+    parser.add_argument("--save_interval_min", type=int, default=15,
+                        help="Auto-save to Drive every N minutes (Colab session safety)")
     return parser.parse_args()
 
 
+# ══════════════════════════════════════════════════════════════
+#  COLAB AUTO-SAVER — Lưu Drive theo thời gian thực
+#  Nếu Colab die sau 3h, checkpoint gần nhất trên Drive sẽ được
+#  dùng để resume, không mất quá N phút training.
+# ══════════════════════════════════════════════════════════════
+
+class TimedDriveSaver:
+    """
+    Auto-save checkpoint lên Google Drive mỗi N phút.
+    Không phụ thuộc vào epoch boundary — an toàn với session giới hạn.
+    """
+    def __init__(self, drive_path: str, interval_min: int = 15):
+        self.drive_path = Path(drive_path) if drive_path else None
+        self.interval_sec = interval_min * 60
+        self._last_save = time.time()
+
+    def should_save(self) -> bool:
+        return (self.drive_path is not None and
+                time.time() - self._last_save >= self.interval_sec)
+
+    def save(self, local_path: str, tag: str = "timed"):
+        if self.drive_path is None:
+            return
+        try:
+            self.drive_path.mkdir(parents=True, exist_ok=True)
+            dest = self.drive_path / f"checkpoint_{tag}.pt"
+            shutil.copy(local_path, dest)
+            self._last_save = time.time()
+            ts = datetime.now().strftime("%H:%M:%S")
+            print(f"  [Drive] ✓ Saved {tag} checkpoint at {ts} → {dest}")
+        except Exception as e:
+            print(f"  [Drive] ✗ Backup failed: {e}")
+
+    def force_save(self, local_path: str, tag: str = "latest"):
+        """Gọi cuối epoch bất kể timer."""
+        self._last_save = 0  # reset để trigger ngay
+        self.save(local_path, tag)
+
+
+# ══════════════════════════════════════════════════════════════
+#  PHASE CONTROL — Đóng/mở phần model theo training phase
+# ══════════════════════════════════════════════════════════════
+
+def set_training_phase(model: UpgradedHSTGNN, phase: int, logger):
+    """
+    Phase 0 (joint): Train tất cả (default)
+    Phase 1 (pretrain): Freeze mBART decoder → chỉ train graph/temporal encoder
+    Phase 2 (finetune): Freeze encoder → chỉ train mBART decoder
+
+    Chiến lược 2-phase giúp:
+    - Phase 1 trên Colab free (2-3h): Encoder học keypoint → gloss tốt
+    - Phase 2 trên Colab free (2-3h): Decoder học gloss → text
+    """
+    if phase == 0:
+        for p in model.parameters():
+            p.requires_grad = True
+        logger.info("Phase 0: Training ALL parameters jointly")
+
+    elif phase == 1:
+        # Freeze mBART decoder
+        for p in model.text_decoder.parameters():
+            p.requires_grad = False
+        # Unfreeze encoder
+        for p in model.graph_encoder.parameters():
+            p.requires_grad = True
+        for p in model.temporal_encoder.parameters():
+            p.requires_grad = True
+        for p in model.gloss_head.parameters():
+            p.requires_grad = True
+        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        logger.info(f"Phase 1 (Pretrain Encoder): {trainable/1e6:.1f}M trainable params "
+                    f"(mBART frozen)")
+
+    elif phase == 2:
+        # Freeze encoder
+        for p in model.graph_encoder.parameters():
+            p.requires_grad = False
+        for p in model.temporal_encoder.parameters():
+            p.requires_grad = False
+        # Unfreeze mBART (but respect its own internal freeze)
+        for name, p in model.text_decoder.named_parameters():
+            if not ("shared" in name or "embed" in name or
+                    any(f"decoder.layers.{i}" in name for i in range(6))):
+                p.requires_grad = True
+        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        logger.info(f"Phase 2 (Finetune Decoder): {trainable/1e6:.1f}M trainable params "
+                    f"(encoder frozen)")
+
+
+# ══════════════════════════════════════════════════════════════
+#  LOSS ROUTING — dataset_mode aware
+# ══════════════════════════════════════════════════════════════
+
+def compute_loss(
+    outputs: dict,
+    batch: dict,
+    criterion_ctc: nn.CTCLoss,
+    criterion_ce: nn.CrossEntropyLoss,
+    config,
+) -> tuple:
+    """
+    FIX: CTC loss chỉ áp dụng cho "continuous" samples (PHOENIX, CSL).
+    "isolated" samples (WLASL, Kaggle sign) → chỉ CE loss.
+
+    Lý do: CTC cần input_length >> target_length.
+    WLASL video chỉ có 1 ký hiệu (T rất ngắn) → CTC sẽ throw error
+    hoặc gây gradient explosion.
+    """
+    gloss_ids = batch["gloss_ids"]      # (B, Lg)
+    gloss_lengths = batch["gloss_lengths"]  # (B,)
+    dataset_modes = batch.get("dataset_mode", ["continuous"] * gloss_ids.size(0))
+
+    # Mask tách continuous vs isolated
+    is_continuous = torch.tensor(
+        [m == "continuous" for m in dataset_modes],
+        device=gloss_ids.device, dtype=torch.bool
+    )
+
+    loss_ctc = torch.tensor(0.0, device=gloss_ids.device)
+    loss_ce = torch.tensor(0.0, device=gloss_ids.device)
+
+    # ── CTC Loss (chỉ cho continuous samples) ──
+    n_continuous = is_continuous.sum().item()
+    if n_continuous > 0:
+        # Lọc continuous samples
+        c_idx = is_continuous.nonzero(as_tuple=True)[0]
+        log_probs = outputs["gloss_log_probs"][:, c_idx, :]   # (T, n_cont, G)
+        input_lengths = outputs["encoder_lengths"][c_idx]      # (n_cont,)
+        targets = gloss_ids[c_idx]                             # (n_cont, Lg)
+        target_lengths = gloss_lengths[c_idx]                  # (n_cont,)
+
+        # Đảm bảo input_length >= target_length (CTC constraint)
+        valid = input_lengths >= target_lengths
+        if valid.sum() > 0:
+            loss_ctc = criterion_ctc(
+                log_probs[:, valid, :],
+                targets[valid],
+                input_lengths[valid],
+                target_lengths[valid],
+            )
+
+    # ── CE Loss (tất cả samples) ──
+    text_logits = outputs.get("text_logits")
+    if text_logits is not None:
+        B, Lw, V = text_logits.shape
+        text_ids = batch["text_ids"]
+        loss_ce = criterion_ce(
+            text_logits.reshape(B * Lw, V),
+            text_ids.reshape(B * Lw),
+        )
+
+    total_loss = config.lambda_ctc * loss_ctc + config.lambda_ce * loss_ce
+    return total_loss, loss_ctc, loss_ce
+
+
+# ══════════════════════════════════════════════════════════════
+#  TRAIN ONE EPOCH
+# ══════════════════════════════════════════════════════════════
+
 def train_one_epoch(model, dataloader, optimizer, scaler, scheduler,
-                    criterion_ctc, criterion_ce, config, epoch, logger):
+                    criterion_ctc, criterion_ce, config, epoch, logger,
+                    drive_saver: TimedDriveSaver = None,
+                    output_dir: str = "outputs/"):
     model.train()
     losses = AverageMeter()
     ctc_losses = AverageMeter()
@@ -68,14 +231,14 @@ def train_one_epoch(model, dataloader, optimizer, scaler, scheduler,
     optimizer.zero_grad()
 
     for step, batch in enumerate(dataloader):
-        keypoints = batch["keypoints"].to(config.device)        # (B, T, N, 3)
-        gloss_ids = batch["gloss_ids"].to(config.device)        # (B, Lg)
-        text_ids = batch["text_ids"].to(config.device)          # (B, Lw)
+        keypoints = batch["keypoints"].to(config.device)
+        gloss_ids = batch["gloss_ids"].to(config.device)
+        text_ids = batch["text_ids"].to(config.device)
         gloss_lengths = batch["gloss_lengths"].to(config.device)
-        text_lengths = batch["text_lengths"].to(config.device)
         keypoint_lengths = batch["keypoint_lengths"].to(config.device)
+        # Giữ dataset_mode trên CPU (list of strings)
 
-        with autocast(enabled=config.use_amp):
+        with autocast('cuda', enabled=config.use_amp):
             outputs = model(
                 keypoints=keypoints,
                 keypoint_lengths=keypoint_lengths,
@@ -83,24 +246,13 @@ def train_one_epoch(model, dataloader, optimizer, scaler, scheduler,
                 text_targets=text_ids,
             )
 
-            # CTC loss (feats → gloss)
-            log_probs = outputs["gloss_log_probs"]              # (T, B, vocab)
-            input_lengths = outputs["encoder_lengths"]          # (B,)
-            loss_ctc = criterion_ctc(
-                log_probs, gloss_ids,
-                input_lengths, gloss_lengths
+            # Dataset-mode aware loss routing
+            batch["gloss_ids"] = gloss_ids
+            batch["gloss_lengths"] = gloss_lengths
+            batch["text_ids"] = text_ids
+            loss, loss_ctc, loss_ce = compute_loss(
+                outputs, batch, criterion_ctc, criterion_ce, config
             )
-
-            # Cross-Entropy loss (gloss → text via mBART decoder)
-            logits = outputs["text_logits"]                     # (B, Lw, vocab)
-            B, Lw, V = logits.shape
-            loss_ce = criterion_ce(
-                logits.reshape(B * Lw, V),
-                text_ids.reshape(B * Lw)
-            )
-
-            loss = (config.lambda_ctc * loss_ctc +
-                    config.lambda_ce * loss_ce)
             loss = loss / config.gradient_accumulation_steps
 
         scaler.scale(loss).backward()
@@ -113,10 +265,16 @@ def train_one_epoch(model, dataloader, optimizer, scaler, scheduler,
             scheduler.step()
             optimizer.zero_grad()
 
-        B = keypoints.size(0)
-        losses.update(loss.item() * config.gradient_accumulation_steps, B)
-        ctc_losses.update(loss_ctc.item(), B)
-        ce_losses.update(loss_ce.item(), B)
+            # ── Timed Drive backup (per optimizer step) ──
+            if drive_saver and drive_saver.should_save():
+                latest_path = Path(output_dir) / "checkpoint_latest.pt"
+                if latest_path.exists():
+                    drive_saver.save(str(latest_path), "timed")
+
+        B_size = keypoints.size(0)
+        losses.update(loss.item() * config.gradient_accumulation_steps, B_size)
+        ctc_losses.update(loss_ctc.item(), B_size)
+        ce_losses.update(loss_ce.item(), B_size)
 
         if step % config.log_interval == 0:
             lr = optimizer.param_groups[0]["lr"]
@@ -129,12 +287,15 @@ def train_one_epoch(model, dataloader, optimizer, scaler, scheduler,
     return {"loss": losses.avg, "ctc_loss": ctc_losses.avg, "ce_loss": ce_losses.avg}
 
 
+# ══════════════════════════════════════════════════════════════
+#  EVALUATE
+# ══════════════════════════════════════════════════════════════
+
 @torch.no_grad()
 def evaluate(model, dataloader, gloss_vocab, text_vocab, config, logger, split="val"):
     model.eval()
     all_gloss_preds, all_gloss_gts = [], []
     all_text_preds, all_text_gts = [], []
-    losses = AverageMeter()
 
     criterion_ctc = nn.CTCLoss(blank=0, reduction="mean", zero_infinity=True)
     criterion_ce = nn.CrossEntropyLoss(ignore_index=text_vocab.pad_id)
@@ -146,7 +307,7 @@ def evaluate(model, dataloader, gloss_vocab, text_vocab, config, logger, split="
         gloss_lengths = batch["gloss_lengths"].to(config.device)
         keypoint_lengths = batch["keypoint_lengths"].to(config.device)
 
-        with autocast(enabled=config.use_amp):
+        with autocast('cuda', enabled=config.use_amp):
             outputs = model(
                 keypoints=keypoints,
                 keypoint_lengths=keypoint_lengths,
@@ -154,16 +315,15 @@ def evaluate(model, dataloader, gloss_vocab, text_vocab, config, logger, split="
                 text_targets=text_ids,
             )
 
-        # Decode predictions
-        gloss_preds = model.decode_gloss(outputs["gloss_log_probs"])
-        text_preds = model.decode_text(
-            outputs["encoder_hidden"],
-            outputs["encoder_lengths"],
-            text_vocab,
-            config.max_text_len
-        )
+            # Decode predictions
+            gloss_preds = model.decode_gloss(outputs["gloss_log_probs"])
+            text_preds = model.decode_text(
+                outputs["encoder_hidden"],
+                outputs["encoder_lengths"],
+                text_vocab,
+                config.max_text_len
+            )
 
-        # Convert IDs to strings
         for i in range(keypoints.size(0)):
             gp = gloss_vocab.ids_to_text(gloss_preds[i])
             gg = gloss_vocab.ids_to_text(gloss_ids[i].cpu().tolist())
@@ -191,6 +351,10 @@ def evaluate(model, dataloader, gloss_vocab, text_vocab, config, logger, split="
     }
 
 
+# ══════════════════════════════════════════════════════════════
+#  MAIN
+# ══════════════════════════════════════════════════════════════
+
 def main():
     args = parse_args()
     config = get_config(args.config)
@@ -202,9 +366,9 @@ def main():
     set_seed(config.seed)
 
     logger.info("=" * 60)
-    logger.info("  UPGRADED HST-GNN TRAINING")
+    logger.info("  UPGRADED HST-GNN v2 TRAINING")
     logger.info(f"  Config: {args.config}")
-    logger.info(f"  Device: {config.device}")
+    logger.info(f"  Phase: {args.phase}  |  Device: {config.device}")
     logger.info("=" * 60)
 
     # ── Datasets ──────────────────────────────────────────────
@@ -264,10 +428,14 @@ def main():
         num_heads=config.num_heads,
         num_gloss_classes=len(gloss_vocab),
         text_vocab_size=len(text_vocab),
+        temporal_window_size=getattr(config, "temporal_window_size", 5),
         decoder_name=config.decoder_name,
         dropout=config.dropout,
         use_gradient_checkpointing=config.gradient_checkpointing,
     ).to(config.device)
+
+    # Áp dụng training phase
+    set_training_phase(model, args.phase, logger)
 
     total_params = sum(p.numel() for p in model.parameters())
     train_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -278,7 +446,6 @@ def main():
     criterion_ce = nn.CrossEntropyLoss(ignore_index=text_vocab.pad_id)
 
     # ── Optimizer ─────────────────────────────────────────────
-    # Phân biệt pretrained (LR nhỏ) và scratch (LR lớn)
     pretrained_params = []
     scratch_params = []
     for name, param in model.named_parameters():
@@ -302,16 +469,25 @@ def main():
     scaler = GradScaler(enabled=config.use_amp)
     early_stopping = EarlyStopping(patience=config.patience, mode="min")
 
+    # ── Timed Drive saver ─────────────────────────────────────
+    drive_saver = TimedDriveSaver(
+        drive_path=args.drive_backup,
+        interval_min=args.save_interval_min,
+    )
+
     # ── Resume ────────────────────────────────────────────────
     start_epoch = 1
     best_wer = float("inf")
     if args.resume:
-        start_epoch, best_wer = load_checkpoint(args.resume, model, optimizer, scheduler, logger)
+        start_epoch, best_wer = load_checkpoint(
+            args.resume, model, optimizer, scheduler, logger
+        )
     else:
-        # Auto-detect checkpoint trong output_dir
         ckpt_path = Path(config.output_dir) / "checkpoint_latest.pt"
         if ckpt_path.exists():
-            start_epoch, best_wer = load_checkpoint(str(ckpt_path), model, optimizer, scheduler, logger)
+            start_epoch, best_wer = load_checkpoint(
+                str(ckpt_path), model, optimizer, scheduler, logger
+            )
 
     if args.eval_only:
         logger.info("Running evaluation only...")
@@ -326,15 +502,18 @@ def main():
         t0 = time.time()
         train_metrics = train_one_epoch(
             model, train_loader, optimizer, scaler, scheduler,
-            criterion_ctc, criterion_ce, config, epoch, logger
+            criterion_ctc, criterion_ce, config, epoch, logger,
+            drive_saver=drive_saver,
+            output_dir=config.output_dir,
         )
 
-        val_metrics = evaluate(model, val_loader, gloss_vocab, text_vocab, config, logger, "val")
+        val_metrics = evaluate(
+            model, val_loader, gloss_vocab, text_vocab, config, logger, "val"
+        )
 
         elapsed = time.time() - t0
         logger.info(f"Epoch {epoch} done in {elapsed:.1f}s")
 
-        # Log history
         history.append({"epoch": epoch, **train_metrics, **val_metrics})
         with open(Path(config.output_dir) / "history.json", "w") as f:
             json.dump(history, f, indent=2)
@@ -354,8 +533,15 @@ def main():
             best_wer=best_wer,
             output_dir=config.output_dir,
             is_best=is_best,
-            drive_backup=config.drive_backup,
+            drive_backup=None,  # Handled by TimedDriveSaver below
         )
+
+        # Cuối mỗi epoch: force save lên Drive
+        latest_path = Path(config.output_dir) / "checkpoint_latest.pt"
+        drive_saver.force_save(str(latest_path), f"epoch_{epoch:03d}")
+        if is_best:
+            best_path = Path(config.output_dir) / "checkpoint_best.pt"
+            drive_saver.save(str(best_path), "best")
 
         # Early stopping
         if early_stopping(val_metrics["wer"]):
@@ -365,7 +551,8 @@ def main():
     # ── Final Test ────────────────────────────────────────────
     logger.info("Loading best checkpoint for final test...")
     best_ckpt = Path(config.output_dir) / "checkpoint_best.pt"
-    load_checkpoint(str(best_ckpt), model, None, None, logger)
+    if best_ckpt.exists():
+        load_checkpoint(str(best_ckpt), model, None, None, logger)
     test_metrics = evaluate(model, test_loader, gloss_vocab, text_vocab, config, logger, "test")
 
     logger.info("=" * 60)

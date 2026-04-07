@@ -28,6 +28,7 @@ class Config:
     num_graph_layers: int = 2
     num_temporal_layers: int = 4
     num_heads: int = 8
+    temporal_window_size: int = 5      # Sliding window attention (bài gốc: window ≤ 5)
     dropout: float = 0.1
     decoder_name: str = "facebook/mbart-large-50"
     gradient_checkpointing: bool = True
